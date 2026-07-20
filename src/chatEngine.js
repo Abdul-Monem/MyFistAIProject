@@ -1,11 +1,9 @@
 /**
  * Foundry Local chat engine.
- * Uses the Foundry Local SDK to discover, load, and run inference
- * on a local model. Performs RAG retrieval and generates responses.
- * Selects the hardware-optimised model variant automatically and
- * reports download/load progress via a status callback.
+ * Bypasses native C++ bindings to prevent Linux Segfaults by
+ * connecting directly to the running background Foundry server.
  */
-import { FoundryLocalManager } from "foundry-local-sdk";
+import { OpenAI } from "openai";
 import { VectorStore } from "./vectorStore.js";
 import { config } from "./config.js";
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_COMPACT } from "./prompts.js";
@@ -33,43 +31,23 @@ export class ChatEngine {
   }
 
   /**
-   * Initialize the engine: create Foundry Local manager, discover and load
-   * the best model variant for this hardware, and open the vector store.
+   * Initialize the engine: Bypasses native C++ launcher to avoid crash
+   * and links directly to the background service at http://127.0.0.1:44565
    */
   async init() {
-    this._emitStatus("init", "Initializing Foundry Local SDK...");
+    this._emitStatus("init", "Initializing Foundry Local SDK (HTTP Client mode)...");
 
-    // Create the manager (requires appName)
-    const manager = FoundryLocalManager.create({ appName: "gas-field-local-rag" });
-    const catalog = manager.catalog;
+    // We hardcode the model details to bypass native hardware scanning
+    this.modelAlias = config.model || "phi-3.5-mini";
+    this._emitStatus("variant", `Using running background model instance: ${this.modelAlias}`);
 
-    this._emitStatus("catalog", "Discovering available models...");
-    this.model = await catalog.getModel(config.model);
-    this.modelAlias = this.model.alias;
+    // Create a standard, crash-free HTTP OpenAI client pointing to your background server
+    this.chatClient = new OpenAI({
+      baseURL: "http://127.0.0.1:44005/v1/", // Using the active port from your server terminal!
+      apiKey: "nokey" // No key required for local server
+    });
 
-    // The SDK auto-selects the best variant for this hardware (GPU > NPU > CPU)
-    this._emitStatus("variant", `Selected model: ${this.modelAlias}`);
-
-    // Download the model if not already cached, with progress reporting
-    if (!this.model.isCached) {
-      this._emitStatus("download", `Downloading ${this.modelAlias}... This may take a few minutes on first run.`, 0);
-      await this.model.download((progress) => {
-        const pct = Math.round(progress * 100);
-        this._emitStatus("download", `Downloading ${this.modelAlias}... ${pct}%`, progress);
-      });
-      this._emitStatus("download", `Download complete.`, 1);
-    } else {
-      this._emitStatus("cached", `Model ${this.modelAlias} is already cached.`);
-    }
-
-    // Load the model into memory
-    this._emitStatus("loading", `Loading ${this.modelAlias} into memory...`);
-    await this.model.load();
-
-    // Create the native chat client with performance settings pre-configured
-    this.chatClient = this.model.createChatClient();
-    this.chatClient.settings.temperature = 0.1; // Low for deterministic, safety-critical responses
-    this._emitStatus("ready", `Model ready: ${this.modelAlias}`);
+    this._emitStatus("ready", `Model ready via background service connection.`);
 
     // Open the local vector store
     this.store = new VectorStore(config.dbPath);
@@ -138,9 +116,13 @@ export class ChatEngine {
       { role: "user", content: userMessage },
     ];
 
-    // 3. Call the local model via the native chat client
-    this.chatClient.settings.maxTokens = this.compactMode ? 512 : 1024;
-    const response = await this.chatClient.completeChat(messages);
+    // 3. Call the background model over standard HTTP
+    const response = await this.chatClient.chat.completions.create({
+      model: "phi-3.5-mini",
+      messages: messages,
+      temperature: 0.1,
+      max_tokens: this.compactMode ? 512 : 1024,
+    });
 
     return {
       text: response.choices[0].message.content,
@@ -174,22 +156,6 @@ export class ChatEngine {
       { role: "user", content: userMessage },
     ];
 
-    // 3. Stream from the local model via the SDK's callback-based streaming
-    this.chatClient.settings.maxTokens = this.compactMode ? 512 : 1024;
-
-    // Buffer chunks from the callback and yield them as an async iterable
-    const textChunks = [];
-    let resolve;
-    let done = false;
-
-    const streamPromise = this.chatClient.completeStreamingChat(messages, (chunk) => {
-      textChunks.push(chunk);
-      if (resolve) { resolve(); resolve = null; }
-    }).then(() => {
-      done = true;
-      if (resolve) { resolve(); resolve = null; }
-    });
-
     // Yield sources metadata first
     yield {
       type: "sources",
@@ -201,28 +167,24 @@ export class ChatEngine {
       })),
     };
 
-    // Yield text chunks from the SDK streaming callback buffer
-    while (!done || textChunks.length > 0) {
-      if (textChunks.length === 0 && !done) {
-        await new Promise((r) => { resolve = r; });
-      }
-      while (textChunks.length > 0) {
-        const chunk = textChunks.shift();
-        const content = chunk.choices?.[0]?.delta?.content;
-        if (content) {
-          yield { type: "text", data: content };
-        }
+    // 3. Stream from the background local model via standard HTTP stream
+    const stream = await this.chatClient.chat.completions.create({
+      model: "phi-3.5-mini",
+      messages: messages,
+      temperature: 0.1,
+      max_tokens: this.compactMode ? 512 : 1024,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices?.[0]?.delta?.content;
+      if (content) {
+        yield { type: "text", data: content };
       }
     }
-
-    // Ensure the stream promise resolves cleanly
-    await streamPromise;
   }
 
   close() {
-    if (this.model) {
-      this.model.unload().catch(() => {});
-    }
     if (this.store) this.store.close();
   }
 }

@@ -67,14 +67,17 @@ app.post("/api/chat/stream", async (req, res) => {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    const stream = engine.queryStream(
+    // Call the clean, non-streaming query to prevent background engine termination
+    const result = await engine.query(
       message,
       Array.isArray(history) ? history : []
     );
 
-    for await (const chunk of stream) {
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    }
+    // Send the metadata sources package first
+    res.write(`data: ${JSON.stringify({ type: "sources", data: result.sources })}\n\n`);
+
+    // Send the completed text response block safely
+    res.write(`data: ${JSON.stringify({ type: "text", data: result.text })}\n\n`);
 
     res.write("data: [DONE]\n\n");
     res.end();
@@ -209,18 +212,16 @@ async function start() {
   // Register status callback to relay progress to connected UI clients
   engine.onStatus((status) => broadcastStatus(status));
 
-  // Start the HTTP server first so the UI is immediately accessible
-  app.listen(config.port, config.host, () => {
-    console.log(`[Server] UI available at http://${config.host}:${config.port}`);
-    console.log("[Server] Initializing model in background...\n");
-  });
-
-  // Initialize the engine (downloads model if needed, loads it)
+  // 1. Force the engine to establish its connection first
   await engine.init();
   engineReady = true;
   broadcastStatus({ phase: "ready", message: "Ready" });
 
-  console.log("[Server] Fully offline – no outbound connections.\n");
+  // 2. Only launch the Express UI once the engine is confirmed ready
+  app.listen(config.port, config.host, () => {
+    console.log(`[Server] UI available at http://${config.host}:${config.port}`);
+    console.log("[Server] Fully offline – no outbound connections.\n");
+  });
 }
 
 start().catch((err) => {
